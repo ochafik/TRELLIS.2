@@ -1,5 +1,6 @@
 from typing import *
 import torch
+import torch.nn.functional as F
 from .. import VarLenTensor
 from .. import config
 
@@ -211,6 +212,75 @@ def sparse_scaled_dot_product_attention(*args, **kwargs):
             max_q_seqlen = max(q_seqlen)
             max_kv_seqlen = max(kv_seqlen)
         out = flash_attn_3.flash_attn_varlen_func(q, k, v, cu_seqlens_q, cu_seqlens_kv, max_q_seqlen, max_kv_seqlen)
+    elif config.ATTN in ['sdpa', 'naive']:
+        # AMD HIP compatible fallback using PyTorch's scaled_dot_product_attention
+        # Convert variable-length tensors to padded dense tensors, run SDPA, convert back
+        if num_all_args == 1:
+            q, k, v = qkv.unbind(dim=1)  # Each is [T, H, C]
+        elif num_all_args == 2:
+            k, v = kv.unbind(dim=1)  # Each is [T_KV, H, C]
+
+        # Get dimensions
+        H = q.shape[-2]
+        C_q = q.shape[-1]
+        C_v = v.shape[-1]
+        N = len(q_seqlen)
+        max_q = max(q_seqlen)
+        max_kv = max(kv_seqlen)
+
+        # Pad q to dense: [N, max_q, H, C]
+        q_dense = torch.zeros(N, max_q, H, C_q, device=device, dtype=q.dtype)
+        k_dense = torch.zeros(N, max_kv, H, C_q, device=device, dtype=k.dtype)
+        v_dense = torch.zeros(N, max_kv, H, C_v, device=device, dtype=v.dtype)
+
+        # Fill in the sequences
+        cu_q = 0
+        cu_kv = 0
+        for i in range(N):
+            q_len = q_seqlen[i]
+            kv_len = kv_seqlen[i]
+            q_dense[i, :q_len] = q[cu_q:cu_q + q_len]
+            k_dense[i, :kv_len] = k[cu_kv:cu_kv + kv_len]
+            v_dense[i, :kv_len] = v[cu_kv:cu_kv + kv_len]
+            cu_q += q_len
+            cu_kv += kv_len
+
+        # Reshape for SDPA: [N, H, L, C]
+        q_dense = q_dense.permute(0, 2, 1, 3)  # [N, H, max_q, C]
+        k_dense = k_dense.permute(0, 2, 1, 3)  # [N, H, max_kv, C]
+        v_dense = v_dense.permute(0, 2, 1, 3)  # [N, H, max_kv, C]
+
+        # Create attention mask for variable-length sequences
+        # Mask shape: [N, 1, max_q, max_kv] - True means MASKED (do not attend)
+        attn_mask = torch.ones(N, 1, max_q, max_kv, device=device, dtype=torch.bool)
+        for i in range(N):
+            attn_mask[i, :, :q_seqlen[i], :kv_seqlen[i]] = False
+
+        # Run SDPA
+        if config.ATTN == 'naive':
+            # Naive implementation without flash attention
+            scale = 1.0 / (C_q ** 0.5)
+            attn_weights = torch.matmul(q_dense, k_dense.transpose(-2, -1)) * scale
+            attn_weights = attn_weights.masked_fill(attn_mask, float('-inf'))
+            attn_weights = F.softmax(attn_weights, dim=-1)
+            out_dense = torch.matmul(attn_weights, v_dense)
+        else:
+            # Use PyTorch's optimized SDPA
+            out_dense = F.scaled_dot_product_attention(
+                q_dense, k_dense, v_dense,
+                attn_mask=attn_mask,
+                dropout_p=0.0,
+                is_causal=False,
+            )
+
+        # Reshape back: [N, H, max_q, C] -> [N, max_q, H, C]
+        out_dense = out_dense.permute(0, 2, 1, 3)
+
+        # Extract variable-length output
+        out_list = []
+        for i in range(N):
+            out_list.append(out_dense[i, :q_seqlen[i]])  # [q_len, H, C]
+        out = torch.cat(out_list, dim=0)  # [T, H, C]
     else:
         raise ValueError(f"Unknown attention module: {config.ATTN}")
     

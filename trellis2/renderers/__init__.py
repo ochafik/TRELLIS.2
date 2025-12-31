@@ -2,6 +2,8 @@ import importlib
 
 __attributes = {
     'MeshRenderer': 'mesh_renderer',
+    'MeshRendererGL': 'mesh_renderer_gl',
+    'create_mesh_renderer': 'mesh_renderer_gl',
     'VoxelRenderer': 'voxel_renderer',
     'PbrMeshRenderer': 'pbr_mesh_renderer',
     'EnvMap': 'pbr_mesh_renderer',
@@ -28,6 +30,7 @@ def __getattr__(name):
 # For Pylance
 if __name__ == '__main__':
     from .mesh_renderer import MeshRenderer
+    from .mesh_renderer_gl import MeshRendererGL, create_mesh_renderer
     from .voxel_renderer import VoxelRenderer
     from .pbr_mesh_renderer import PbrMeshRenderer, EnvMap
     
