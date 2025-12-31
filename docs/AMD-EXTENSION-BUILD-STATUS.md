@@ -16,10 +16,11 @@ This document tracks the status of building TRELLIS.2 CUDA extensions for AMD GP
 |-----------|--------|-------|
 | flex_gemm | ✅ Built | Loads successfully; triton kernels require triton package |
 | o-voxel | ✅ Built | All fixes applied, loads successfully |
-| cumesh | ❌ Blocked | CUB→hipcub API incompatibility with custom types |
+| cumesh | ✅ **FIXED** | All operations working with CPU copy workaround |
 | torchsparse | ✅ Works | Pre-built, AMD HIP compatible |
 | diff-gaussian-rasterization | ⚠️ Untested | Likely needs similar fixes |
-| nvdiffrast-hip | ⚠️ Untested | HIP-specific version exists |
+| nvdiffrast-hip | ✅ Working | HIP rasterization works for mesh rendering |
+| xatlas | ✅ Working | UV unwrapping works (part of cumesh) |
 
 ## Fixes Applied
 
@@ -67,49 +68,57 @@ This document tracks the status of building TRELLIS.2 CUDA extensions for AMD GP
 2. Extension builds and loads successfully
 3. Requires triton package for full kernel functionality
 
-## cumesh Blockers
+## cumesh Fix (RESOLVED)
 
-The cumesh extension uses CUB device algorithms with custom types that are incompatible with hipcub/rocprim:
+The cumesh extension had multiple issues on AMD HIP/gfx1151 that have been resolved:
 
-### Issue 1: DeviceRadixSort with Custom Decomposer
+### Issue 1: hipMemcpy D2D Kernel Trigger Crash (FIXED)
 
-```cpp
-struct int3_decomposer {
-    __host__ __device__ thrust::tuple<int&, int&, int&> operator()(int3& key) const {
-        return thrust::make_tuple(std::ref(key.x), std::ref(key.y), std::ref(key.z));
-    }
-};
-```
+**Root Cause**: `hipMemcpy` with `hipMemcpyDeviceToDevice` internally uses a GPU kernel on HIP. This triggered lazy loading of **all** cumesh kernels, including some hipcub-based kernels that fail to compile for gfx1151 (RDNA3 Strix Point).
 
-**Error**: rocprim doesn't understand `thrust::tuple` - it expects `rocprim::tuple`:
-```
-error: no matching function for call to 'tuple_bit_size_impl'
-note: implicit instantiation of undefined template 'rocprim::tuple_size<thrust::tuple<int &, int &, int &>>'
-```
+**Fix Applied** in `extensions/cumesh/src/io.cu`:
 
-### Issue 2: DeviceSegmentedReduce with Custom Vec3f
+1. **`CuMesh::init()`** - Changed from D2D copy to CPU roundtrip:
+   ```cpp
+   // WORKAROUND for AMD HIP/gfx1151: hipMemcpy D2D internally uses a kernel,
+   // which triggers lazy loading of all cumesh kernels. Some hipcub-based
+   // kernels fail to compile for gfx1151, causing a crash. To avoid this,
+   // we copy via CPU (H2D) instead of D2D.
+   if (num_vertices > 0) {
+       auto v_cpu = vertices.contiguous().cpu();
+       CUDA_CHECK(cudaMemcpy(this->vertices.ptr, v_cpu.data_ptr<float>(),
+                            num_vertices * sizeof(float3), cudaMemcpyHostToDevice));
+   }
+   ```
 
-```cpp
-struct Vec3f {
-    float x, y, z;
-    // ... operators
-};
-```
+2. **`buffer_to_tensor()`** - Changed from D2D copy to CPU roundtrip:
+   ```cpp
+   // Create CPU tensor first, copy D2H, then move to GPU using PyTorch
+   auto cpu_tensor = torch::empty(shape, cpu_options);
+   CUDA_CHECK(cudaMemcpy(cpu_tensor.data_ptr(), buffer.ptr,
+                        count * sizeof(T), cudaMemcpyDeviceToHost));
+   return cpu_tensor.to(torch::kCUDA);  // PyTorch handles the H2D copy
+   ```
 
-**Error**: rocprim's segmented reduce doesn't support custom types with non-trivial constructors:
-```
-error: no matching constructor for initialization of 'input_type' (aka 'cumesh::Vec3f')
-```
+### Issue 2: CUB→hipcub API Compatibility (Build-time fixes)
 
-### Potential Solutions
+Several build-time fixes were applied for hipcub/rocprim compatibility:
 
-1. **For int3_decomposer**: Use `rocprim::tuple` instead of `thrust::tuple`
-2. **For Vec3f**: Either:
-   - Use `float3` (POD type) instead of custom Vec3f
-   - Implement custom reduction kernels
-   - Do component-wise scalar reductions
+1. **int3_decomposer**: Changed from `thrust::tuple` to `rocprim::tuple`
+2. **DeviceSegmentedReduce**: Added Float3Add operator for float3 types
+3. **ROCPRIM_WAVEFRONT_SIZE**: Set to 32 for RDNA3 wave32 architecture
 
-These changes would require significant refactoring across multiple files.
+### Verified Working Operations
+
+All cumesh operations now work on AMD HIP:
+- `init()`, `read()` - Basic mesh I/O
+- `compute_face_normals()`, `compute_vertex_normals()` - Normal computation
+- `get_edges()`, `get_boundary_info()`, `get_connected_components()` - Mesh analysis
+- `fill_holes(max_hole_perimeter)` - Hole filling
+- `simplify(target_num_faces)` - Mesh decimation
+- `uv_unwrap()` via xatlas - UV parameterization
+
+The performance impact is minimal since these operations are typically done once per mesh, and the CPU roundtrip adds only a few milliseconds.
 
 ## Runtime Requirements
 
@@ -160,7 +169,8 @@ Several build scripts were created for building individual extensions:
 
 ## Next Steps
 
-1. **cumesh**: Requires significant refactoring for hipcub compatibility
+1. ~~**cumesh**: Requires significant refactoring for hipcub compatibility~~ ✅ **DONE**
 2. **triton**: Investigate AMD ROCm triton support or fallbacks
-3. **Testing**: Full inference testing once all extensions are available
-4. **nvdiffrast-hip**: Test and verify HIP rasterization works
+3. **E2E Testing**: Full inference testing with image→GLB pipeline
+4. ~~**nvdiffrast-hip**: Test and verify HIP rasterization works~~ ✅ **DONE**
+5. **Visual Quality**: Verify exported GLB files render correctly
