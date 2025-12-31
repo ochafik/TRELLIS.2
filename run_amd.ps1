@@ -25,6 +25,14 @@ if (-not $WORKDIR) {
 }
 Set-Location $WORKDIR
 
+# Set up ROCm/HIP paths
+$rocmPath = "C:\Program Files\AMD\ROCm\6.4"
+if (Test-Path $rocmPath) {
+    $env:HIP_PATH = $rocmPath
+    $env:ROCM_PATH = $rocmPath
+    $env:PATH = "$rocmPath\bin;$env:PATH"
+}
+
 # Check venv exists
 $venvPython = Join-Path $WORKDIR ".venv\Scripts\python.exe"
 if (-not (Test-Path $venvPython)) {

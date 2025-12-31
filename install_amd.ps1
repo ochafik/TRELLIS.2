@@ -12,6 +12,18 @@ Write-Host "==========================================" -ForegroundColor Cyan
 $WORKDIR = Split-Path -Parent $MyInvocation.MyCommand.Path
 Set-Location $WORKDIR
 
+# Set up ROCm/HIP paths
+$rocmPath = "C:\Program Files\AMD\ROCm\6.4"
+if (Test-Path $rocmPath) {
+    Write-Host "[ROCm] Found ROCm 6.4 at $rocmPath" -ForegroundColor Green
+    $env:HIP_PATH = $rocmPath
+    $env:ROCM_PATH = $rocmPath
+    $env:PATH = "$rocmPath\bin;$env:PATH"
+    $env:CMAKE_PREFIX_PATH = "$rocmPath;$env:CMAKE_PREFIX_PATH"
+} else {
+    Write-Host "[WARN] ROCm 6.4 not found at $rocmPath - HIP extensions may fail to build" -ForegroundColor Yellow
+}
+
 # Check for Python
 Write-Host ""
 Write-Host "[1/8] Checking Python..." -ForegroundColor Yellow
